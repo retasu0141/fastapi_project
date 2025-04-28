@@ -10,7 +10,7 @@ import json
 app = FastAPI()
 
 # SlackのWebhook URL
-WEBHOOK_URL = "https://hooks.slack.com/services/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"
+WEBHOOK_URL = os.environ['SLACK_WEBHOOK_URL']
 
 # Google認証設定
 SCOPES = [
