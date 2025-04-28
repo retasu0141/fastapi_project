@@ -11,23 +11,23 @@ from googleapiclient.errors import HttpError
 
 app = FastAPI()
 
-# 環境変数から取得
+# SlackのWebhook URL
 WEBHOOK_URL = os.environ['SLACK_WEBHOOK_URL']
-credentials_info = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
 
+# Google認証設定
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/documents"
 ]
+credentials_info = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
 credentials = Credentials.from_service_account_info(credentials_info, scopes=SCOPES)
+
 gc = gspread.authorize(credentials)
 docs_service = build('docs', 'v1', credentials=credentials)
 
-google_account_email = credentials_info.get('client_email')
-
-# スプレッドシートID保存用
-document_tracker = {}
+last_spreadsheet_ids = {}
+last_document_ids = {}
 
 # ========================== 関数 ==========================
 
@@ -41,70 +41,89 @@ def auto_resize_columns(worksheet):
         width = max(100, min(max_length * 10, 400))
         set_column_width(worksheet, chr(65+i), width)
 
-def send_slack_notification(message, webhook_url):
-    payload = {"text": message}
-    headers = {"Content-Type": "application/json"}
-    response = requests.post(webhook_url, json=payload, headers=headers)
-    return response.status_code
-
-def create_spreadsheet(title):
+def create_new_spreadsheet(title, topic_name):
     sh = gc.create(title)
     worksheet = sh.sheet1
-    sh.share(google_account_email, perm_type='user', role='writer')
+    sh.share('nattsuchanneru@gmail.com', perm_type='user', role='writer')
+    last_spreadsheet_ids[topic_name] = sh.id
     return sh, worksheet
 
-def create_document(title):
+def get_or_create_spreadsheet(topic_name, force_new=False):
+    if force_new or topic_name not in last_spreadsheet_ids:
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        title = f"{topic_name}_{now}"
+        return create_new_spreadsheet(title, topic_name)
+    try:
+        sh = gc.open_by_key(last_spreadsheet_ids[topic_name])
+        worksheet = sh.sheet1
+        return sh, worksheet
+    except gspread.exceptions.SpreadsheetNotFound:
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        title = f"{topic_name}_{now}"
+        return create_new_spreadsheet(title, topic_name)
+
+def create_new_document(title, topic_name):
     doc = docs_service.documents().create(body={"title": title}).execute()
     doc_id = doc.get('documentId')
+    last_document_ids[topic_name] = doc_id
     permission = {
         'type': 'user',
         'role': 'writer',
-        'emailAddress': google_account_email
+        'emailAddress': 'nattsuchanneru@gmail.com'
     }
     drive_service = build('drive', 'v3', credentials=credentials)
     drive_service.permissions().create(fileId=doc_id, body=permission, sendNotificationEmail=False).execute()
     return doc_id
 
-def append_to_document(doc_id, topic, rows):
-    requests_batch = []
-    # 最初にタイトルとしてtopicを追加
-    requests_batch.append({
+def send_slack_notification(message):
+    payload = {"text": message}
+    headers = {"Content-Type": "application/json"}
+    requests.post(WEBHOOK_URL, json=payload, headers=headers)
+
+def write_to_document(doc_id, data, title):
+    requests_body = []
+    requests_body.append({
         'insertText': {
             'location': {'index': 1},
-            'text': f"{topic}\n"
+            'text': title + "\n"
         }
     })
-    requests_batch.append({
+    requests_body.append({
         'updateParagraphStyle': {
-            'range': {'startIndex': 1, 'endIndex': 1 + len(topic)},
+            'range': {'startIndex': 1, 'endIndex': len(title) + 2},
             'paragraphStyle': {'namedStyleType': 'TITLE'},
             'fields': 'namedStyleType'
         }
     })
 
-    for row in rows:
-        for key, value in row.items():
-            if key in ["新規作成"]:
-                continue
-            key_text = key.replace(':', '')
-            start_idx = None
-            text = f"\n{key_text}\n{value}\n"
-            requests_batch.append({
-                'insertText': {
-                    'location': {'index': 1},
-                    'text': text
-                }
-            })
-            # 見出しに設定
-            requests_batch.append({
-                'updateParagraphStyle': {
-                    'range': {'startIndex': 1, 'endIndex': 1 + len(key_text)},
-                    'paragraphStyle': {'namedStyleType': 'HEADING_1'},
-                    'fields': 'namedStyleType'
-                }
-            })
+    cursor = len(title) + 2
+    for key, value in data.items():
+        if not value:
+            continue
+        clean_key = key.replace(':', '')
+        requests_body.append({
+            'insertText': {
+                'location': {'index': cursor},
+                'text': clean_key + "\n"
+            }
+        })
+        cursor += len(clean_key) + 1
+        requests_body.append({
+            'updateParagraphStyle': {
+                'range': {'startIndex': cursor - len(clean_key) - 1, 'endIndex': cursor},
+                'paragraphStyle': {'namedStyleType': 'HEADING_2'},
+                'fields': 'namedStyleType'
+            }
+        })
+        requests_body.append({
+            'insertText': {
+                'location': {'index': cursor},
+                'text': str(value) + "\n"
+            }
+        })
+        cursor += len(str(value)) + 1
 
-    docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests_batch}).execute()
+    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests_body}).execute()
 
 # ========================== APIエンドポイント ==========================
 
@@ -126,19 +145,8 @@ async def receive_data(request: Request):
         force_new = row.get("新規作成", False)
         topic = row.get("話題", "未分類")
 
-        if force_new or topic not in document_tracker:
-            now = datetime.now().strftime("%Y%m%d_%H%M%S")
-            sheet_title = f"{topic}_{now}"
-            doc_title = f"{topic}議事録_{now}"
-            sh, worksheet = create_spreadsheet(sheet_title)
-            doc_id = create_document(doc_title)
-            document_tracker[topic] = {'spreadsheet_id': sh.id, 'doc_id': doc_id}
-        else:
-            sh = gc.open_by_key(document_tracker[topic]['spreadsheet_id'])
-            worksheet = sh.sheet1
-            doc_id = document_tracker[topic]['doc_id']
+        sh, worksheet = get_or_create_spreadsheet(topic, force_new)
 
-        # スプレッドシートへの書き込み
         if worksheet.row_count == 0 or worksheet.acell('A1').value is None:
             headers = list(row.keys())
             worksheet.append_row(headers)
@@ -149,16 +157,30 @@ async def receive_data(request: Request):
             )
             format_cell_range(worksheet, f'A1:{chr(65+len(headers)-1)}1', header_format)
 
-        worksheet.append_row(list(row.values()))
+        flat_row = []
+        for v in row.values():
+            if isinstance(v, list):
+                flat_row.append(", ".join(map(str, v)))
+            else:
+                flat_row.append(str(v))
+
+        worksheet.append_row(flat_row)
         auto_resize_columns(worksheet)
 
-        # ドキュメントへの書き込み
-        append_to_document(doc_id, topic, [row])
-
         spreadsheet_url = sh.url
-        doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
 
-    slack_message = f"✅ 新しいデータが記録されました！\nスプレッドシート: {spreadsheet_url}\nドキュメント: {doc_url}"
-    send_slack_notification(slack_message, WEBHOOK_URL)
+        # Googleドキュメント側
+        if force_new or topic not in last_document_ids:
+            now = datetime.now().strftime("%Y%m%d_%H%M%S")
+            doc_title = f"{topic}議事録_{now}"
+            doc_id = create_new_document(doc_title, topic)
+        else:
+            doc_id = last_document_ids[topic]
+
+        write_to_document(doc_id, row, topic)
+
+        document_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+
+        send_slack_notification(f"✅ スプレッドシート: {spreadsheet_url}\n📝 ドキュメント: {document_url}")
 
     return {"status": "success", "received": data}
