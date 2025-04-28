@@ -85,6 +85,10 @@ def send_slack_notification(message, webhook_url):
 async def receive_data(request: Request):
     data = await request.json()
 
+    # ここで文字列だったらパースする
+    if isinstance(data, str):
+        data = json.loads(data)
+
     for row in data:
         force_new = row.get("新規作成", False)
         topic = row.get("話題", "未分類")
@@ -107,6 +111,7 @@ async def receive_data(request: Request):
         auto_resize_columns(worksheet)
 
         spreadsheet_url = sh.url
+
     slack_message = f"📝 スプレッドシートにデータを追記しました！\n{spreadsheet_url}"
     send_slack_notification(slack_message, WEBHOOK_URL)
 
