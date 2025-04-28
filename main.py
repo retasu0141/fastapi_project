@@ -139,7 +139,17 @@ def send_slack_notification(message, webhook_url):
 
 @app.post("/trigger")
 async def receive_data(request: Request):
-    data = await request.json()
+    raw_data = await request.json()
+
+    if isinstance(raw_data, dict):
+        data = [raw_data]
+    elif isinstance(raw_data, list):
+        if all(isinstance(row, str) for row in raw_data):
+            data = [json.loads(row) for row in raw_data]
+        else:
+            data = raw_data
+    else:
+        raise ValueError("Unexpected data format")
 
     for row in data:
         force_new = row.get("新規作成", False)
