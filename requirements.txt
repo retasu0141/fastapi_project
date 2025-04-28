@@ -1,2 +1,6 @@
 fastapi
 uvicorn
+gspread
+google-auth
+gspread-formatting
+requests
