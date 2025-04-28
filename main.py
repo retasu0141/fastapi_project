@@ -4,6 +4,8 @@ from google.oauth2.service_account import Credentials
 from datetime import datetime
 from gspread_formatting import *
 import requests
+import os
+import json
 
 app = FastAPI()
 
@@ -15,10 +17,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-credentials = Credentials.from_service_account_file(
-    "credentials.json",
-    scopes=SCOPES
-)
+credentials_info = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
+credentials = Credentials.from_service_account_info(credentials_info)
+
 gc = gspread.authorize(credentials)
 
 #SPREADSHEET_ID = "1Ff9-MAVulwRWVL-pJq33xaV1LM6KpK6xSF1l5Vh677M"
