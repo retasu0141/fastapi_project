@@ -1,130 +1,125 @@
 from fastapi import FastAPI, Request
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from datetime import datetime
-from gspread_formatting import *
-import requests
-import os
 import json
+import os
+import datetime
+import requests
 
 app = FastAPI()
 
-# 環境変数から設定を取得
-WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-credentials_info = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/documents"
-]
-credentials = Credentials.from_service_account_info(credentials_info, scopes=SCOPES)
-gc = gspread.authorize(credentials)
+# Google API認証
+credentials = service_account.Credentials.from_service_account_file(
+    "service_account.json",
+    scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/documents"
+    ],
+)
+
+gspread_client = gspread.authorize(credentials)
+
 docs_service = build('docs', 'v1', credentials=credentials)
+drive_service = build('drive', 'v3', credentials=credentials)
 
-# スプレッドシート管理用
-last_spreadsheet_ids = {}
+# Slack Webhook URL
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
-# ========= 共通関数 =========
-
-def send_slack_notification(message):
-    payload = {"text": message}
-    headers = {"Content-Type": "application/json"}
-    requests.post(WEBHOOK_URL, json=payload, headers=headers)
-
-def auto_resize_columns(worksheet):
-    all_values = worksheet.get_all_values()
-    if not all_values:
-        return
-    columns = list(zip(*all_values))
-    for i, col in enumerate(columns):
-        max_length = max(len(str(cell)) for cell in col)
-        width = max(100, min(max_length * 10, 400))
-        set_column_width(worksheet, chr(65+i), width)
-
-# ========= スプレッドシート関連 =========
-
-def create_spreadsheet(title, headers):
-    sh = gc.create(title)
-    worksheet = sh.sheet1
-    sh.share('nattsuchanneru@gmail.com', perm_type='user', role='writer')
-    worksheet.append_row(headers)
-    auto_resize_columns(worksheet)
-    return sh, worksheet
-
-def write_to_spreadsheet(headers, rows, topic):
-    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    title = f"{topic}_{now}"
-    sh, worksheet = create_spreadsheet(title, headers)
-    for row in rows:
-        worksheet.append_row(row)
-    auto_resize_columns(worksheet)
-    send_slack_notification(f"📄 新しいスプレッドシートを作成しました！\n{sh.url}")
-
-# ========= ドキュメント関連 =========
-
-def create_document(title):
-    doc = docs_service.documents().create(body={"title": title}).execute()
-    doc_id = doc.get("documentId")
-    return doc_id
-
-def write_to_document(doc_id, contents):
+# ドキュメントに書き込む関数
+def write_to_document(doc_id, row, topic):
     requests_list = []
-    for block in contents:
-        if block['type'] == 'heading':
+    for key, value in row.items():
+        if value:
+            # まずテキストを挿入
             requests_list.append({
                 "insertText": {
                     "location": {"index": 1},
-                    "text": block['text'] + "\n"
+                    "text": f"{key}\n"
                 }
             })
+            # 見出しスタイルを適用
             requests_list.append({
                 "updateParagraphStyle": {
-                    "range": {"startIndex": 1, "endIndex": 1 + len(block['text']) + 1},
-                    "paragraphStyle": {"namedStyleType": "HEADING_1"},
+                    "range": {
+                        "startIndex": 1,
+                        "endIndex": 1 + len(key) + 1
+                    },
+                    "paragraphStyle": {
+                        "namedStyleType": "HEADING_2"
+                    },
                     "fields": "namedStyleType"
                 }
             })
-        elif block['type'] == 'paragraph':
+            # 本文を挿入
             requests_list.append({
                 "insertText": {
                     "location": {"index": 1},
-                    "text": block['text'] + "\n"
+                    "text": f"{value}\n\n"
                 }
             })
-    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": list(reversed(requests_list))}).execute()
 
-# ========= エンドポイント =========
+    docs_service.documents().batchUpdate(
+        documentId=doc_id,
+        body={"requests": list(reversed(requests_list))}
+    ).execute()
+
+# スプレッドシートに書き込む関数
+def write_to_spreadsheet(spreadsheet_id, worksheet_title, headers, rows):
+    sh = gspread_client.open_by_key(spreadsheet_id)
+    try:
+        worksheet = sh.worksheet(worksheet_title)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = sh.add_worksheet(title=worksheet_title, rows="100", cols="20")
+
+    if worksheet.row_count == 0:
+        worksheet.append_row(headers)
+
+    for row in rows:
+        worksheet.append_row(row)
+
+# Slack通知関数
+def send_slack_notification(message):
+    if SLACK_WEBHOOK_URL:
+        requests.post(SLACK_WEBHOOK_URL, json={"text": message})
 
 @app.post("/trigger")
 async def trigger(request: Request):
-    raw_data = await request.json()
+    data = await request.json()
 
-    if isinstance(raw_data, dict):
-        data = [raw_data]
-    elif isinstance(raw_data, list):
-        if all(isinstance(row, str) for row in raw_data):
-            data = [json.loads(row) for row in raw_data]
-        else:
-            data = raw_data
-    else:
-        raise ValueError("Unexpected data format")
+    if not isinstance(data, dict):
+        raise ValueError("Invalid data format")
 
-    for row in data:
-        if row.get("type") == "spreadsheet":
-            headers = row.get("headers")
-            rows = row.get("rows")
-            topic = row.get("topic", "未分類")
-            if headers and rows:
-                write_to_spreadsheet(headers, rows, topic)
+    type_ = data.get("type")
+    topic = data.get("topic", "未分類")
 
-        elif row.get("type") == "document":
-            topic = row.get("topic", "未分類")
-            contents = row.get("contents", [])
-            now = datetime.now().strftime("%Y%m%d_%H%M%S")
-            title = f"{topic}_議事録_{now}"
-            doc_id = create_document(title)
-            write_to_document(doc_id, contents)
-            send_slack_notification(f"📝 新しいドキュメントを作成しました！\nhttps://docs.google.com/document/d/{doc_id}/edit")
+    if type_ == "spreadsheet":
+        headers = data.get("headers", [])
+        rows = data.get("rows", [])
 
-    return {"status": "success", "received": data}
+        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        sheet_title = f"{topic}_{now}"
+        spreadsheet = gspread_client.create(sheet_title)
+        spreadsheet.share(None, perm_type='anyone', role='writer')
+
+        write_to_spreadsheet(spreadsheet.id, "Sheet1", headers, rows)
+
+        slack_message = f"✅ スプレッドシートが作成されました！\n{spreadsheet.url}"
+        send_slack_notification(slack_message)
+
+    elif type_ == "document":
+        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        doc_title = f"{topic}_議事録_{now}"
+        doc = drive_service.files().create(
+            body={"name": doc_title, "mimeType": "application/vnd.google-apps.document"},
+            fields="id"
+        ).execute()
+        doc_id = doc.get("id")
+
+        write_to_document(doc_id, data.get("content", {}), topic)
+
+        slack_message = f"📝 ドキュメントが作成されました！\nhttps://docs.google.com/document/d/{doc_id}/edit"
+        send_slack_notification(slack_message)
+
+    return {"status": "success"}
