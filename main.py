@@ -22,17 +22,19 @@ SCOPES = [
 credentials_info = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
 credentials = Credentials.from_service_account_info(credentials_info, scopes=SCOPES)
 
+# gspreadの認証
 gc = gspread.authorize(credentials)
-docs_service = build('docs', 'v1', credentials=credentials)
 
-# 話題ごとの最後に作成されたスプレッドシートIDとドキュメントIDを保存する辞書
+# GoogleドキュメントのAPIクライアント
+docs_service = build('docs', 'v1', credentials=credentials)
+drive_service = build('drive', 'v3', credentials=credentials)
+
+# 話題ごとの最後に作成されたスプレッドシートIDを保存する辞書
 last_spreadsheet_ids = {}
-last_document_ids = {}
 
 # ========================== ここから関数 ==========================
 
 def auto_resize_columns(worksheet):
-    """データに合わせて列幅を自動設定"""
     all_values = worksheet.get_all_values()
     if not all_values:
         return
@@ -52,49 +54,57 @@ def create_new_spreadsheet(title, topic_name):
     last_spreadsheet_ids[topic_name] = sh.id
     return sh, worksheet
 
-def create_new_document(title, topic_name):
+def create_new_document(title, content_dict):
     doc = docs_service.documents().create(body={"title": title}).execute()
     document_id = doc['documentId']
-    document_url = f"https://docs.google.com/document/d/{document_id}/edit"
-    slack_message = f"📄 新しいGoogleドキュメントが作成されました！\n{document_url}"
-    send_slack_notification(slack_message, WEBHOOK_URL)
-    last_document_ids[topic_name] = document_id
-    return document_id
 
-def append_to_document(document_id, data):
+    # コンテンツの挿入
     requests_body = []
 
-    for field, content in data.items():
-        if content:  # 空じゃないときだけ書く
-            # カラム名（見出し）
+    # タイトルを見出しに
+    requests_body.append({
+        'insertText': {
+            'location': {"index": 1},
+            'text': title + "\n\n"
+        }
+    })
+    requests_body.append({
+        'updateParagraphStyle': {
+            'range': {"startIndex": 1, "endIndex": len(title) + 2},
+            'paragraphStyle': {"namedStyleType": "TITLE"},
+            'fields': "namedStyleType"
+        }
+    })
+
+    # 内容を本文に追加
+    for key, value in content_dict.items():
+        if value:
+            text = f"{key}: {value}\n"
             requests_body.append({
-                "insertText": {
-                    "location": {"index": 1},
-                    "text": f"{field}\n"
-                }
-            })
-            requests_body.append({
-                "updateTextStyle": {
-                    "range": {
-                        "startIndex": 1,
-                        "endIndex": 1 + len(field)
-                    },
-                    "textStyle": {
-                        "bold": True,
-                        "fontSize": {"magnitude": 18, "unit": "PT"}
-                    },
-                    "fields": "bold,fontSize"
-                }
-            })
-            # 本文
-            requests_body.append({
-                "insertText": {
-                    "location": {"index": 1 + len(field)},
-                    "text": f"{content}\n\n"
+                'insertText': {
+                    'location': {"index": 1},
+                    'text': text
                 }
             })
 
     docs_service.documents().batchUpdate(documentId=document_id, body={"requests": requests_body}).execute()
+
+    drive_service.permissions().create(
+        fileId=document_id,
+        body={
+            'type': 'user',
+            'role': 'writer',
+            'emailAddress': 'nattsuchanneru@gmail.com'
+        },
+        fields='id',
+        sendNotificationEmail=False
+    ).execute()
+
+    document_url = f"https://docs.google.com/document/d/{document_id}/edit"
+    slack_message = f"\ud83d\udcc4 新しいGoogleドキュメントが作成されました！\n{document_url}"
+    send_slack_notification(slack_message, WEBHOOK_URL)
+
+    return document_url
 
 def get_or_create_spreadsheet(topic_name, force_new=False):
     if force_new:
@@ -119,19 +129,6 @@ def get_or_create_spreadsheet(topic_name, force_new=False):
         title = f"{topic_name}_{now}"
         return create_new_spreadsheet(title, topic_name)
 
-def get_or_create_document(topic_name, force_new=False):
-    if force_new:
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        title = f"{topic_name}_{now}"
-        return create_new_document(title, topic_name)
-
-    if topic_name in last_document_ids:
-        return last_document_ids[topic_name]
-    else:
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        title = f"{topic_name}_{now}"
-        return create_new_document(title, topic_name)
-
 def send_slack_notification(message, webhook_url):
     payload = {"text": message}
     headers = {"Content-Type": "application/json"}
@@ -142,23 +139,12 @@ def send_slack_notification(message, webhook_url):
 
 @app.post("/trigger")
 async def receive_data(request: Request):
-    raw_data = await request.json()
-
-    if isinstance(raw_data, dict):
-        data = [raw_data]
-    elif isinstance(raw_data, list):
-        if all(isinstance(row, str) for row in raw_data):
-            data = [json.loads(row) for row in raw_data]
-        else:
-            data = raw_data
-    else:
-        raise ValueError("Unexpected data format")
+    data = await request.json()
 
     for row in data:
         force_new = row.get("新規作成", False)
         topic = row.get("話題", "未分類")
 
-        # スプレッドシート
         sh, worksheet = get_or_create_spreadsheet(topic, force_new)
 
         if worksheet.row_count == 0 or worksheet.acell('A1').value is None:
@@ -174,8 +160,13 @@ async def receive_data(request: Request):
         worksheet.append_row(list(row.values()))
         auto_resize_columns(worksheet)
 
-        # Googleドキュメント
-        document_id = get_or_create_document(topic, force_new)
-        append_to_document(document_id, row)
 
+        create_new_document(topic, row)
+
+        spreadsheet_url = sh.url
+
+    slack_message = f"\ud83d\udcdc スプレッドシートにデータを追記しました！\n{spreadsheet_url}"
+    send_slack_notification(slack_message, WEBHOOK_URL)
+
+    print("受け取ったデータ:", data)
     return {"status": "success", "received": data}
