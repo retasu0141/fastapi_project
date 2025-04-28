@@ -3,18 +3,15 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 from gspread_formatting import *
+from googleapiclient.discovery import build
 import requests
 import os
 import json
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 app = FastAPI()
 
-# SlackのWebhook URL
+# 環境変数
 WEBHOOK_URL = os.environ['SLACK_WEBHOOK_URL']
-
-# Google認証設定
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -23,8 +20,10 @@ SCOPES = [
 credentials_info = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
 credentials = Credentials.from_service_account_info(credentials_info, scopes=SCOPES)
 
+# Google APIクライアント
 gc = gspread.authorize(credentials)
 docs_service = build('docs', 'v1', credentials=credentials)
+drive_service = build('drive', 'v3', credentials=credentials)
 
 last_spreadsheet_ids = {}
 last_document_ids = {}
@@ -48,11 +47,62 @@ def create_new_spreadsheet(title, topic_name):
     last_spreadsheet_ids[topic_name] = sh.id
     return sh, worksheet
 
+def create_new_document(title, topic_name):
+    doc = docs_service.documents().create(body={"title": title}).execute()
+    doc_id = doc['documentId']
+    drive_service.permissions().create(
+        fileId=doc_id,
+        body={"role": "writer", "type": "user", "emailAddress": "nattsuchanneru@gmail.com"},
+        fields="id"
+    ).execute()
+    last_document_ids[topic_name] = doc_id
+    return doc_id
+
+def write_to_document(doc_id, row, topic):
+    requests_list = []
+
+    for key, value in row.items():
+        clean_key = key.replace(':', '')
+        requests_list.append({
+            "insertText": {
+                "location": {"index": 1},
+                "text": f"\n{value}\n"
+            }
+        })
+        requests_list.append({
+            "updateParagraphStyle": {
+                "range": {"startIndex": 1, "endIndex": 1+len(value)},
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "fields": "namedStyleType"
+            }
+        })
+        requests_list.append({
+            "insertText": {
+                "location": {"index": 1},
+                "text": f"{clean_key}\n"
+            }
+        })
+        requests_list.append({
+            "updateParagraphStyle": {
+                "range": {"startIndex": 1, "endIndex": 1+len(clean_key)},
+                "paragraphStyle": {"namedStyleType": "HEADING_2"},
+                "fields": "namedStyleType"
+            }
+        })
+
+    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": list(reversed(requests_list))}).execute()
+
+def send_slack_notification(message):
+    payload = {"text": message}
+    headers = {"Content-Type": "application/json"}
+    requests.post(WEBHOOK_URL, json=payload, headers=headers)
+
 def get_or_create_spreadsheet(topic_name, force_new=False):
     if force_new or topic_name not in last_spreadsheet_ids:
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
         title = f"{topic_name}_{now}"
         return create_new_spreadsheet(title, topic_name)
+
     try:
         sh = gc.open_by_key(last_spreadsheet_ids[topic_name])
         worksheet = sh.sheet1
@@ -62,70 +112,7 @@ def get_or_create_spreadsheet(topic_name, force_new=False):
         title = f"{topic_name}_{now}"
         return create_new_spreadsheet(title, topic_name)
 
-def create_new_document(title, topic_name):
-    doc = docs_service.documents().create(body={"title": title}).execute()
-    doc_id = doc.get('documentId')
-    last_document_ids[topic_name] = doc_id
-    permission = {
-        'type': 'user',
-        'role': 'writer',
-        'emailAddress': 'nattsuchanneru@gmail.com'
-    }
-    drive_service = build('drive', 'v3', credentials=credentials)
-    drive_service.permissions().create(fileId=doc_id, body=permission, sendNotificationEmail=False).execute()
-    return doc_id
-
-def send_slack_notification(message):
-    payload = {"text": message}
-    headers = {"Content-Type": "application/json"}
-    requests.post(WEBHOOK_URL, json=payload, headers=headers)
-
-def write_to_document(doc_id, data, title):
-    requests_body = []
-    requests_body.append({
-        'insertText': {
-            'location': {'index': 1},
-            'text': title + "\n"
-        }
-    })
-    requests_body.append({
-        'updateParagraphStyle': {
-            'range': {'startIndex': 1, 'endIndex': len(title) + 2},
-            'paragraphStyle': {'namedStyleType': 'TITLE'},
-            'fields': 'namedStyleType'
-        }
-    })
-
-    cursor = len(title) + 2
-    for key, value in data.items():
-        if not value:
-            continue
-        clean_key = key.replace(':', '')
-        requests_body.append({
-            'insertText': {
-                'location': {'index': cursor},
-                'text': clean_key + "\n"
-            }
-        })
-        cursor += len(clean_key) + 1
-        requests_body.append({
-            'updateParagraphStyle': {
-                'range': {'startIndex': cursor - len(clean_key) - 1, 'endIndex': cursor},
-                'paragraphStyle': {'namedStyleType': 'HEADING_2'},
-                'fields': 'namedStyleType'
-            }
-        })
-        requests_body.append({
-            'insertText': {
-                'location': {'index': cursor},
-                'text': str(value) + "\n"
-            }
-        })
-        cursor += len(str(value)) + 1
-
-    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests_body}).execute()
-
-# ========================== APIエンドポイント ==========================
+# ========================== ルート ==========================
 
 @app.post("/trigger")
 async def receive_data(request: Request):
@@ -166,10 +153,9 @@ async def receive_data(request: Request):
 
         worksheet.append_row(flat_row)
         auto_resize_columns(worksheet)
-
         spreadsheet_url = sh.url
 
-        # Googleドキュメント側
+        # ドキュメント
         if force_new or topic not in last_document_ids:
             now = datetime.now().strftime("%Y%m%d_%H%M%S")
             doc_title = f"{topic}議事録_{now}"
@@ -178,9 +164,8 @@ async def receive_data(request: Request):
             doc_id = last_document_ids[topic]
 
         write_to_document(doc_id, row, topic)
-
         document_url = f"https://docs.google.com/document/d/{doc_id}/edit"
 
-        send_slack_notification(f"✅ スプレッドシート: {spreadsheet_url}\n📝 ドキュメント: {document_url}")
+        send_slack_notification(f"✅スプレッドシート: {spreadsheet_url}\n📝ドキュメント: {document_url}")
 
     return {"status": "success", "received": data}
