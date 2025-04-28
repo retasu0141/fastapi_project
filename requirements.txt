@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-requests
-gspread
-google-auth
+python-dotenv
 google-api-python-client
-gspread-formatting
+google-auth
+google-auth-oauthlib
+gspread
+slack_sdk
