@@ -22,9 +22,6 @@ credentials = Credentials.from_service_account_info(credentials_info)
 
 gc = gspread.authorize(credentials)
 
-#SPREADSHEET_ID = "1Ff9-MAVulwRWVL-pJq33xaV1LM6KpK6xSF1l5Vh677M"
-
-# 使うスプレッドシートのフォルダID（必要なら後で追加）
 
 
 # 話題ごとの最後に作成されたスプレッドシートIDを保存する辞書
