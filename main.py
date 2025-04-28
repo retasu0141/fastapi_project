@@ -86,33 +86,35 @@ def send_slack_notification(message, webhook_url):
 async def receive_data(request: Request):
     data = await request.json()
 
-    for row in data:
-        force_new = row.get("新規作成", False)
-        topic = row.get("話題", "未分類")
+    # POSTされるデータは単一オブジェクトなので、そのままrowとする
+    row = data
+    force_new = row.get("新規作成", False)
+    topic = row.get("話題", "未分類")
 
-        # シート取得
-        sh, worksheet = get_or_create_spreadsheet(topic, force_new)
+    # シート取得
+    sh, worksheet = get_or_create_spreadsheet(topic, force_new)
 
-        # ヘッダー行チェック
-        if worksheet.row_count == 0 or worksheet.acell('A1').value is None:
-            headers = list(row.keys())
-            worksheet.append_row(headers)
+    # ヘッダー行チェック
+    if worksheet.row_count == 0 or worksheet.acell('A1').value is None:
+        headers = list(row.keys())
+        worksheet.append_row(headers)
 
-            # ヘッダーに書式
-            header_format = cellFormat(
-                backgroundColor=color(0.9, 0.9, 0.9),
-                textFormat=textFormat(bold=True),
-                horizontalAlignment='CENTER'
-            )
-            format_cell_range(worksheet, f'A1:{chr(65+len(headers)-1)}1', header_format)
+        # ヘッダーに書式
+        header_format = cellFormat(
+            backgroundColor=color(0.9, 0.9, 0.9),
+            textFormat=textFormat(bold=True),
+            horizontalAlignment='CENTER'
+        )
+        format_cell_range(worksheet, f'A1:{chr(65+len(headers)-1)}1', header_format)
 
-            # 列幅設定
-            for i in range(len(headers)):
-                set_column_width(worksheet, chr(65+i), 200)
+        # 列幅設定
+        for i in range(len(headers)):
+            set_column_width(worksheet, chr(65+i), 200)
 
-        # データ追加
-        worksheet.append_row(list(row.values()))
-        spreadsheet_url = sh.url
+    # データ追加
+    worksheet.append_row(list(row.values()))
+    spreadsheet_url = sh.url
+
     slack_message = f"📝 スプレッドシートにデータを追記しました！\n{spreadsheet_url}"
     send_slack_notification(slack_message, WEBHOOK_URL)
 
