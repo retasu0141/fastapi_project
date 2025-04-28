@@ -1,29 +1,35 @@
 from fastapi import FastAPI, Request
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from googleapiclient.discovery import build
+from gspread_formatting import *
 import requests
 import os
 import json
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from datetime import datetime
 
 app = FastAPI()
 
-# 環境変数から情報取得
+# SlackのWebhook URL
 WEBHOOK_URL = os.environ['SLACK_WEBHOOK_URL']
-GOOGLE_CREDENTIALS = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/documents"]
 
-# Googleサービス認証
-credentials = Credentials.from_service_account_info(GOOGLE_CREDENTIALS, scopes=SCOPES)
+# Google認証設定
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents"
+]
+credentials_info = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
+credentials = Credentials.from_service_account_info(credentials_info, scopes=SCOPES)
+
 gc = gspread.authorize(credentials)
+
+drive_service = build('drive', 'v3', credentials=credentials)
 docs_service = build('docs', 'v1', credentials=credentials)
 
-gsheet_last_ids = {}
-gdoc_last_ids = {}
+last_spreadsheet_ids = {}
+last_document_ids = {}
 
-# スプレッドシートの列自動調整
 def auto_resize_columns(worksheet):
     all_values = worksheet.get_all_values()
     if not all_values:
@@ -32,64 +38,32 @@ def auto_resize_columns(worksheet):
     for i, col in enumerate(columns):
         max_length = max(len(str(cell)) for cell in col)
         width = max(100, min(max_length * 10, 400))
-        worksheet.format(chr(65+i)+":"+chr(65+i), {"pixelSize": width})
+        set_column_width(worksheet, chr(65+i), width)
 
-# スプレッドシート作成
-def create_spreadsheet(title, email, topic):
+def create_new_spreadsheet(title, topic_name):
     sh = gc.create(title)
-    sh.share(email, perm_type='user', role='writer')
     worksheet = sh.sheet1
-    gsheet_last_ids[topic] = sh.id
-    return sh, worksheet
+    sh.share('nattsuchanneru@gmail.com', perm_type='user', role='writer')
+    spreadsheet_url = sh.url
+    last_spreadsheet_ids[topic_name] = sh.id
+    return sh, worksheet, spreadsheet_url
 
-# ドキュメント作成
-def create_document(title, email, topic):
+def create_new_document(title, topic_name):
     doc = docs_service.documents().create(body={"title": title}).execute()
-    doc_id = doc.get('documentId')
-    gdoc_last_ids[topic] = doc_id
-    return doc_id
+    doc_id = doc['documentId']
+    drive_service.permissions().create(
+        fileId=doc_id,
+        body={"type": "user", "role": "writer", "emailAddress": 'nattsuchanneru@gmail.com'}
+    ).execute()
+    document_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+    last_document_ids[topic_name] = doc_id
+    return doc_id, document_url
 
-# Slack通知
-def send_slack(message):
+def send_slack_notification(message, webhook_url):
     payload = {"text": message}
     headers = {"Content-Type": "application/json"}
-    requests.post(WEBHOOK_URL, json=payload, headers=headers)
-
-# ドキュメントへ書き込み
-def write_to_document(doc_id, rows, topic):
-    requests_list = []
-    cursor = 1  # 最初にタイトルが入っているので、1から開始
-
-    # まず本文挿入リクエストをまとめる
-    for row in rows:
-        for key, value in row.items():
-            text = f"{key}\n{value}\n\n"
-            requests_list.append({
-                "insertText": {
-                    "location": {"index": cursor},
-                    "text": text
-                }
-            })
-            cursor += len(text)
-
-    # その後、見出しスタイル適用リクエストをまとめる
-    paragraph_cursor = 1
-    for row in rows:
-        for key, value in row.items():
-            key_len = len(key)
-            requests_list.append({
-                "updateParagraphStyle": {
-                    "range": {
-                        "startIndex": paragraph_cursor,
-                        "endIndex": paragraph_cursor + key_len
-                    },
-                    "paragraphStyle": {"namedStyleType": "HEADING_2"},
-                    "fields": "namedStyleType"
-                }
-            })
-            paragraph_cursor += len(key) + len(value) + 2  # key + 改行 + value + 改行
-
-    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests_list}).execute()
+    response = requests.post(webhook_url, json=payload, headers=headers)
+    return response.status_code
 
 @app.post("/trigger")
 async def trigger(request: Request):
@@ -98,8 +72,8 @@ async def trigger(request: Request):
     if isinstance(raw_data, dict):
         data = [raw_data]
     elif isinstance(raw_data, list):
-        if all(isinstance(d, str) for d in raw_data):
-            data = [json.loads(d) for d in raw_data]
+        if all(isinstance(row, str) for row in raw_data):
+            data = [json.loads(row) for row in raw_data]
         else:
             data = raw_data
     else:
@@ -109,31 +83,85 @@ async def trigger(request: Request):
         force_new = row.get("新規作成", False)
         topic = row.get("話題", "未分類")
 
-        # スプレッドシート
-        if force_new or topic not in gsheet_last_ids:
+        # スプレッドシート処理
+        if force_new or topic not in last_spreadsheet_ids:
             now = datetime.now().strftime("%Y%m%d_%H%M%S")
             title = f"{topic}_{now}"
-            sh, worksheet = create_spreadsheet(title, 'nattsuchanneru@gmail.com', topic)
-            send_slack(f"✅ 新しいスプレッドシートが作成されました！\n{sh.url}")
+            sh, worksheet, spreadsheet_url = create_new_spreadsheet(title, topic)
+            # ヘッダー追加
+            worksheet.append_row([str(cell) for cell in row.keys()])
         else:
-            sh = gc.open_by_key(gsheet_last_ids[topic])
+            sh = gc.open_by_key(last_spreadsheet_ids[topic])
             worksheet = sh.sheet1
+            spreadsheet_url = sh.url
 
-        if worksheet.row_count == 0 or worksheet.acell('A1').value is None:
-            worksheet.append_row(list(row.keys()))
-
-        worksheet.append_row(list(row.values()))
+        worksheet.append_row([str(cell) for cell in row.values()])
         auto_resize_columns(worksheet)
 
-        # ドキュメント
-        if force_new or topic not in gdoc_last_ids:
+        # ドキュメント処理
+        if force_new or topic not in last_document_ids:
             now = datetime.now().strftime("%Y%m%d_%H%M%S")
-            doc_title = f"{topic}議事録_{now}"
-            doc_id = create_document(doc_title, 'nattsuchanneru@gmail.com', topic)
-            send_slack(f"📄 新しいGoogleドキュメントが作成されました！\nhttps://docs.google.com/document/d/{doc_id}/edit")
+            title = f"{topic}議事録_{now}"
+            doc_id, document_url = create_new_document(title, topic)
         else:
-            doc_id = gdoc_last_ids[topic]
+            doc_id = last_document_ids[topic]
+            document_url = f"https://docs.google.com/document/d/{doc_id}/edit"
 
-        write_to_document(doc_id, [row], topic)
+        write_to_document(doc_id, row, topic)
+
+        # Slack通知まとめて
+        slack_message = f"✅ スプレッドシート記録: {spreadsheet_url}\n📄 ドキュメント記録: {document_url}"
+        send_slack_notification(slack_message, WEBHOOK_URL)
 
     return {"status": "success"}
+
+def write_to_document(doc_id, row, topic):
+    requests_list = []
+
+    # トピックを最初に挿入
+    requests_list.append({
+        "insertText": {
+            "location": {"index": 1},
+            "text": f"{topic}\n"
+        }
+    })
+    requests_list.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": 1, "endIndex": len(topic)+1},
+            "paragraphStyle": {"namedStyleType": "TITLE"},
+            "fields": "namedStyleType"
+        }
+    })
+
+    # 中身を見出し・本文で追加
+    cursor = len(topic) + 2
+    for key, value in row.items():
+        if key == "話題" or key == "新規作成":
+            continue
+        # 見出し
+        requests_list.append({
+            "insertText": {
+                "location": {"index": cursor},
+                "text": f"{key}\n"
+            }
+        })
+        requests_list.append({
+            "updateParagraphStyle": {
+                "range": {"startIndex": cursor, "endIndex": cursor+len(key)},
+                "paragraphStyle": {"namedStyleType": "HEADING_2"},
+                "fields": "namedStyleType"
+            }
+        })
+        cursor += len(key) + 1
+
+        # 本文
+        value_text = str(value)
+        requests_list.append({
+            "insertText": {
+                "location": {"index": cursor},
+                "text": f"{value_text}\n"
+            }
+        })
+        cursor += len(value_text) + 1
+
+    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests_list}).execute()
