@@ -18,7 +18,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 credentials_info = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
-credentials = Credentials.from_service_account_info(credentials_info)
+credentials = Credentials.from_service_account_info(credentials_info, scopes=SCOPES)
 
 gc = gspread.authorize(credentials)
 
