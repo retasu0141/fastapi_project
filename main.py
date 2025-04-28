@@ -22,6 +22,7 @@ credentials = Credentials.from_service_account_info(credentials_info, scopes=SCO
 
 gc = gspread.authorize(credentials)
 docs_service = build('docs', 'v1', credentials=credentials)
+drive_service = build('drive', 'v3', credentials=credentials)
 
 last_spreadsheet_ids = {}
 
@@ -41,6 +42,9 @@ def create_new_spreadsheet(title, topic_name):
     sh = gc.create(title)
     worksheet = sh.sheet1
     sh.share('nattsuchanneru@gmail.com', perm_type='user', role='writer')
+    spreadsheet_url = sh.url
+    #slack_message = f"✅ 新しいスプレッドシートが作成されました！\n{spreadsheet_url}"
+    #send_slack_notification(slack_message)
     last_spreadsheet_ids[topic_name] = sh.id
     return sh, worksheet
 
@@ -73,8 +77,19 @@ def send_slack_notification(message):
 def create_google_document(title, contents_dict):
     doc = docs_service.documents().create(body={"title": title}).execute()
     doc_id = doc['documentId']
-    requests_body = []
 
+    # 作成直後に共有設定を付与
+    drive_service.permissions().create(
+        fileId=doc_id,
+        body={
+            'type': 'user',
+            'role': 'writer',
+            'emailAddress': 'nattsuchanneru@gmail.com'
+        },
+        fields='id'
+    ).execute()
+
+    requests_body = []
     requests_body.append({
         'insertText': {
             'location': {'index': 1},
